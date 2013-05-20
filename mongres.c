@@ -19,6 +19,7 @@
 
 /* these headers are used by this particular worker's code */
 #include "access/xact.h"
+#include "catalog/pg_type.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "libpq/libpq.h"
@@ -30,6 +31,10 @@
 
 #include "bson.h"
 #include "mongo.h"
+
+#include "bjson.h"
+
+#include "utils/json.h"
 
 PG_MODULE_MAGIC;
 
@@ -145,28 +150,73 @@ handle_insert(pgsocket sock, mongo_header *header,
 	return true;
 }
 
-static void
-send_empty_reply(pgsocket sock, mongo_header *request_header)
+//static void
+//send_empty_reply(pgsocket sock, mongo_header *request_header)
+//{
+//	mongo_reply reply;
+//	mongo_header *header = &reply.head;
+//	mongo_reply_fields *fields = &reply.fields;
+//
+//	header->len = sizeof(reply);
+//	header->id = rand();
+//	header->responseTo = request_header->id;
+//	header->op = 1; // MONGO_OP_REPLY;
+//
+//	fields->flag = 0;
+//	fields->cursorID = 0;
+//	fields->start = 0;
+//	fields->num = 0;
+//
+//	if (write(sock, &reply, sizeof(reply)) != sizeof(reply))
+//	{
+//		ereport(LOG,
+//				(errmsg("could not write reply: %m")));
+//	}
+//}
+
+static bool
+send_reply(pgsocket sock, mongo_header *request_header,
+		   StringInfo documents, int ndocs)
 {
 	mongo_reply reply;
 	mongo_header *header = &reply.head;
 	mongo_reply_fields *fields = &reply.fields;
+	int hsize = sizeof(mongo_header) + sizeof(mongo_reply_fields);
 
-	header->len = sizeof(reply);
+	header->len = hsize + documents->len;
 	header->id = rand();
 	header->responseTo = request_header->id;
-	header->op = 1; // MONGO_OP_REPLY;
+	header->op = 1;
 
 	fields->flag = 0;
 	fields->cursorID = 0;
 	fields->start = 0;
-	fields->num = 0;
+	fields->num = ndocs;
 
-	if (write(sock, &reply, sizeof(reply)) != sizeof(reply))
+	if (write(sock, &reply, hsize) != hsize)
 	{
 		ereport(LOG,
 				(errmsg("could not write reply: %m")));
+		return false;
 	}
+
+	if (write(sock, documents->data, documents->len) !=
+			documents->len)
+	{
+		ereport(LOG,
+				(errmsg("could not write reply: %m")));
+		return false;
+	}
+
+	return true;
+}
+
+static Oid
+find_function(const char *regprocedure)
+{
+	return DatumGetObjectId(
+			DirectFunctionCall1(regprocedurein,
+					CStringGetDatum(regprocedure)));
 }
 
 static bool
@@ -177,6 +227,12 @@ handle_query(pgsocket sock, mongo_header *header,
 	NameData	namespace;
 	bson		b;
 	char	   *json;
+
+	Oid			funcoid;
+	Datum		result;
+	Datum	   *values;
+	int			nelem, i;
+	StringInfoData output;
 
 	elog(LOG, "OP_QUERY");
 	flags = *((int32 *) payload);
@@ -191,19 +247,37 @@ handle_query(pgsocket sock, mongo_header *header,
 	payload += 8;
 
 	b.data = payload;
-	json = read_bson(&b);
+	json = bson_to_json(NULL, b.data);
 	ereport(LOG,
 			(errmsg("json = %s", json)));
+
+	funcoid = find_function("mongres_find(text, json, int, int)");
+
+	result = OidFunctionCall4(funcoid,
+							  PointerGetDatum(cstring_to_text(NameStr(namespace))),
+							  PointerGetDatum(cstring_to_text(json)),
+							  Int32GetDatum(0),
+							  Int32GetDatum(0));
 	pfree(json);
 
-//	if (strcmp(NameStr(namespace), "admin.$cmd") == 0)
-//	{
-//		handle_admin_command(
-//	}
-//	else
-		send_empty_reply(sock, header);
+	initStringInfo(&output);
+	//{
+	//	bson bres;
+	//	bres.data = json_to_bson(DatumGetTextP(result));
+	//	appendBinaryStringInfo(&output, bres.data, bson_size(&bres));
+	//	nelem = DatumGetInt32(DirectFunctionCall1(json_array_length, result));
+	//}
+	deconstruct_array(DatumGetArrayTypeP(result),
+					  JSONOID, -1, false, 'i', &values, NULL, &nelem);
+	for (i = 0; i < nelem; i++)
+	{
+		bson	bres;
 
-	return true;
+		bres.data = json_to_bson(DatumGetTextP(values[i]));
+		appendBinaryStringInfo(&output, bres.data, bson_size(&bres));
+	}
+
+	return send_reply(sock, header, &output, nelem);
 }
 
 static bool
@@ -298,16 +372,37 @@ mongres_main(void *main_arg)
 {
 //	worktable	   *table = (worktable *) main_arg;
 //	StringInfoData	buf;
+	pgsocket sock = 0;
+	SockAddr raddr;
+	sigjmp_buf	local_sigjmp_buf;
 
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
 	/* Connect to our database */
-	BackgroundWorkerInitializeConnection("postgres", NULL);
+	BackgroundWorkerInitializeConnection("mongres", NULL);
 
 //	elog(LOG, "%s initialized with %s.%s",
 //		 MyBgworkerEntry->bgw_name, table->schema, table->name);
 	initialize_mongres();
+
+	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+	{
+		closesocket(sock);
+		/* Report the error to the client and/or server log */
+		EmitErrorReport();
+
+		HOLD_INTERRUPTS();
+		/*
+		 * Abort the current transaction in order to recover.
+		 */
+		AbortCurrentTransaction();
+		/* Now we can allow interrupts again */
+		RESUME_INTERRUPTS();
+	}
+
+	/* We can now handle ereport(ERROR) */
+	PG_exception_stack = &local_sigjmp_buf;
 
 	/*
 	 * Main loop: do this until the SIGTERM handler tells us to terminate
@@ -344,8 +439,6 @@ mongres_main(void *main_arg)
 
 		if (rc & WL_SOCKET_READABLE)
 		{
-			pgsocket sock;
-			SockAddr raddr;
 
 			raddr.salen = sizeof(raddr.addr);
 			sock = accept(MGListenSocket[0],
@@ -361,7 +454,16 @@ mongres_main(void *main_arg)
 
 			for (;;)
 			{
-				if (!handle_message(sock, raddr))
+				bool	res;
+
+				SetCurrentStatementStartTimestamp();
+				StartTransactionCommand();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				res = handle_message(sock, raddr);
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+
+				if (!res)
 					break;
 			}
 			closesocket(sock);

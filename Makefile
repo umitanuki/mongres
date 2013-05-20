@@ -1,6 +1,6 @@
 
-MODULE_big = libmongres
-OBJS = mongres.o
+MODULE_big = mongres
+OBJS = mongres.o bjson.o
 
 override CPPFLAGS += -Imongo-c-driver/src
 SHLIB_LINK += mongo-c-driver/libmongoc.a
