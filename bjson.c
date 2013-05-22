@@ -9,6 +9,26 @@
 static char *bson_to_json_recurse(StringInfo buf_in,
 					const char *data, bool is_object);
 
+static char *
+quote_string(const char *s)
+{
+	char	   *result = palloc(strlen(s) * 2 + 3);
+	char	   *r = result;
+
+	*r++ = '"';
+	while (*s)
+	{
+		if (*s == '"')
+			*r++ = '\\';
+		*r++ = *s;
+		s++;
+	}
+	*r++ = '"';
+	*r++ = '\0';
+
+	return result;
+}
+
 char *
 bson_to_json(StringInfo buf_in, const char *data)
 {
@@ -35,6 +55,7 @@ bson_to_json_recurse(StringInfo buf, const char *data, bool is_object)
 	bson_iterator i;
 	const char *key;
 	char oidhex[25];
+	char *str;
 	bool first = true;
 
 	bson_iterator_from_buffer(&i, data);
@@ -62,11 +83,13 @@ bson_to_json_recurse(StringInfo buf, const char *data, bool is_object)
 				appendStringInfo(buf, "%f", bson_iterator_double(&i));
 				break;
 			case BSON_STRING:
-				appendStringInfoString(buf, bson_iterator_string(&i));
+				str = quote_string(bson_iterator_string(&i));
+				appendStringInfoString(buf, str);
 				break;
 			case BSON_OID:
 				bson_oid_to_string(bson_iterator_oid(&i), oidhex);
-				appendStringInfoString(buf, oidhex);
+				str = quote_string(oidhex);
+				appendStringInfoString(buf, str);
 				break;
 			case BSON_BOOL:
 				appendStringInfoString(buf, bson_iterator_bool(&i) ? "true" : "false");

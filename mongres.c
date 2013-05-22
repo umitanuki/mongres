@@ -50,8 +50,6 @@ static int mongres_listen_port = 27017;
 pgsocket	MGListenSocket[1];
 
 /* Function prototypes */
-static int bson_to_stringinfo(const char *fmt, ...)
-  __attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
 
 
 /*
@@ -84,43 +82,12 @@ mongres_sighup(SIGNAL_ARGS)
 		SetLatch(&MyProc->procLatch);
 }
 
-static StringInfoData Jsonizer;
-
-static int
-bson_to_stringinfo(const char *fmt, ...)
+static Oid
+find_function(const char *regprocedure)
 {
-	int		orig_len = Jsonizer.len;
-
-	for (;;)
-	{
-		va_list		args;
-		bool		success;
-		va_start(args, fmt);
-		success = appendStringInfoVA(&Jsonizer, fmt, args);
-		va_end(args);
-		if (success)
-			break;
-		enlargeStringInfo(&Jsonizer, Jsonizer.maxlen);
-	}
-
-	return Jsonizer.len - orig_len;
-}
-
-static char *
-read_bson(const bson *b)
-{
-	char	*json;
-
-	bson_printf_func old_printf = bson_printf;
-
-	initStringInfo(&Jsonizer);
-	bson_printf = bson_to_stringinfo;
-	bson_print(b);
-	json = pstrdup(Jsonizer.data);
-	pfree(Jsonizer.data);
-	bson_printf = old_printf;
-
-	return json;
+	return DatumGetObjectId(
+			DirectFunctionCall1(regprocedurein,
+					CStringGetDatum(regprocedure)));
 }
 
 static bool
@@ -128,51 +95,44 @@ handle_insert(pgsocket sock, mongo_header *header,
 			  char *payload, size_t payload_size)
 {
 	int32		flags;
-	bson		b;
 	NameData	namespace;
-	char	   *json;
+	bson		b;
+	StringInfoData jsonbuf;
+	char	   *nameptr, *endptr;
+	Oid			funcoid;
+	Datum		result;
 
 	elog(LOG, "OP_INSERT");
 	flags = *((int32 *) payload);
-	payload += sizeof(int32);
+	nameptr = payload + sizeof(int32);
 
-	StrNCpy(NameStr(namespace), payload, NAMEDATALEN);
+	StrNCpy(NameStr(namespace), nameptr, NAMEDATALEN);
 	ereport(LOG,
 			(errmsg("namespace = %s", NameStr(namespace))));
 
-	b.data = (payload + strlen(NameStr(namespace)) + 1);
-	json = read_bson(&b);
-	ereport(LOG,
-			(errmsg("json = %s", json)));
+	b.data = (nameptr + strlen(NameStr(namespace)) + 1);
+	endptr = payload + payload_size;
+	initStringInfo(&jsonbuf);
+	appendStringInfoChar(&jsonbuf, '[');
+	while (b.data < endptr)
+	{
 
-	pfree(json);
+		if (jsonbuf.len > 1)
+			appendStringInfoChar(&jsonbuf, ',');
+
+		bson_to_json(&jsonbuf, b.data);
+		b.data += bson_size(&b);
+	}
+	appendStringInfoChar(&jsonbuf, ']');
+
+	funcoid = find_function("mongres_insert(text, json)");
+
+	result = OidFunctionCall2(funcoid,
+							  CStringGetTextDatum(NameStr(namespace)),
+							  CStringGetTextDatum(jsonbuf.data));
 
 	return true;
 }
-
-//static void
-//send_empty_reply(pgsocket sock, mongo_header *request_header)
-//{
-//	mongo_reply reply;
-//	mongo_header *header = &reply.head;
-//	mongo_reply_fields *fields = &reply.fields;
-//
-//	header->len = sizeof(reply);
-//	header->id = rand();
-//	header->responseTo = request_header->id;
-//	header->op = 1; // MONGO_OP_REPLY;
-//
-//	fields->flag = 0;
-//	fields->cursorID = 0;
-//	fields->start = 0;
-//	fields->num = 0;
-//
-//	if (write(sock, &reply, sizeof(reply)) != sizeof(reply))
-//	{
-//		ereport(LOG,
-//				(errmsg("could not write reply: %m")));
-//	}
-//}
 
 static bool
 send_reply(pgsocket sock, mongo_header *request_header,
@@ -209,14 +169,6 @@ send_reply(pgsocket sock, mongo_header *request_header,
 	}
 
 	return true;
-}
-
-static Oid
-find_function(const char *regprocedure)
-{
-	return DatumGetObjectId(
-			DirectFunctionCall1(regprocedurein,
-					CStringGetDatum(regprocedure)));
 }
 
 static bool
@@ -256,7 +208,7 @@ handle_query(pgsocket sock, mongo_header *header,
 	result = OidFunctionCall4(funcoid,
 							  PointerGetDatum(cstring_to_text(NameStr(namespace))),
 							  PointerGetDatum(cstring_to_text(json)),
-							  Int32GetDatum(0),
+							  Int32GetDatum(-1),
 							  Int32GetDatum(0));
 	pfree(json);
 
